@@ -1,0 +1,6 @@
+gapgrid-dataset/outimages/**
+model_out/gapgrid/**
+pretrained_ckpt/
+__pycache__/
+*.pyc
+*.pth
