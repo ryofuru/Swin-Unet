@@ -76,6 +76,16 @@ class SwinUnet(nn.Module):
                     current_layer_num = 3-int(k[7:8])
                     current_k = "layers_up." + str(current_layer_num) + k[8:]
                     full_dict.update({current_k:v})
+            # Expand patch_embed.proj.weight from 3ch to 4ch (average of 3ch as 4th)
+            pe_key = 'patch_embed.proj.weight'
+            if pe_key in full_dict and pe_key in model_dict:
+                w_pre = full_dict[pe_key]    # (embed_dim, 3, ph, pw)
+                w_mod = model_dict[pe_key]   # (embed_dim, 4, ph, pw)
+                if w_pre.shape[1] == 3 and w_mod.shape[1] == 4:
+                    avg_ch = w_pre.mean(dim=1, keepdim=True)          # (embed_dim, 1, ph, pw)
+                    full_dict[pe_key] = torch.cat([w_pre, avg_ch], dim=1)  # (embed_dim, 4, ph, pw)
+                    print(f'Expanded {pe_key}: {list(w_pre.shape)} -> {list(full_dict[pe_key].shape)}')
+
             for k in list(full_dict.keys()):
                 if k in model_dict:
                     if full_dict[k].shape != model_dict[k].shape:
