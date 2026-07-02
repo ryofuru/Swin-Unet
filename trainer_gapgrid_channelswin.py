@@ -1,3 +1,8 @@
+"""Trainer for Channel-Swin-Unet on the GapGrid dataset.
+
+Identical to trainer_gapgrid.py in structure; kept as a separate file so that
+output paths and log files go under model_out/gapgrid_channelswin/.
+"""
 import logging
 import os
 import sys
@@ -6,39 +11,29 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from PIL import Image as PILImage, ImageDraw, ImageFont
+from PIL import Image as PILImage, ImageDraw
 from tensorboardX import SummaryWriter
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from datasets.dataset_gapgrid import GapGridDataset, build_samples, IGNORE_INDEX, NUM_CLASSES
 
-SAMPLE_INTERVAL = 50
+SAMPLE_INTERVAL = 5
 
 
 def _id_to_rgb(id_map):
-    """Encode class id as nodeid image format: R=0, G=id//256, B=id%256.
-
-    IGNORE_INDEX pixels are rendered as R=255, G=0, B=0 (matching nodeid dont-care).
-    """
     H, W = id_map.shape
     rgb = np.zeros((H, W, 3), dtype=np.uint8)
     valid = id_map != IGNORE_INDEX
     ids = id_map[valid].astype(np.int32)
     rgb[valid, 0] = 0
-    rgb[valid, 1] = (ids >> 8) & 0xFF   # G = id // 256
-    rgb[valid, 2] = ids & 0xFF           # B = id % 256
-    rgb[~valid, 0] = 255                 # dont-care: R=255
+    rgb[valid, 1] = (ids >> 8) & 0xFF
+    rgb[valid, 2] = ids & 0xFF
+    rgb[~valid, 0] = 255
     return rgb
 
 
 def _save_sample_images(model, db_val, db_train, epoch_num, snapshot_path):
-    """Save side-by-side visualization for one train and one val sample.
-
-    Columns per sample: h_phase | v_phase | colored_G | traindata_code | GT | Prediction
-    GT and Pred are encoded as id = G*256 + B (same as nodeid images).
-    Rows: top = train sample, bottom = val sample
-    """
     model.eval()
 
     def make_row(dataset, idx, label_text):
@@ -60,11 +55,10 @@ def _save_sample_images(model, db_val, db_train, epoch_num, snapshot_path):
         pred_rgb = _id_to_rgb(pred_np)
 
         row = np.concatenate(
-            [gray3(img_np[0]), gray3(img_np[1]), gray3(img_np[2]), gray3(img_np[3]), gt_rgb, pred_rgb],
-            axis=1,
-        )
+            [gray3(img_np[0]), gray3(img_np[1]), gray3(img_np[2]), gray3(img_np[3]),
+             gt_rgb, pred_rgb],
+            axis=1)
 
-        # Add header bar with column labels
         col_labels = ['h_phase', 'v_phase', 'colored_G', 'code', 'GT', 'Pred']
         header_h = 20
         header = np.zeros((header_h, row.shape[1], 3), dtype=np.uint8)
@@ -74,7 +68,6 @@ def _save_sample_images(model, db_val, db_train, epoch_num, snapshot_path):
             draw.text((i * W + 4, 3), name, fill=(255, 255, 255))
         header = np.array(img_header)
 
-        # Left label (Train / Val)
         side_w = 40
         side = np.zeros((H + header_h, side_w, 3), dtype=np.uint8)
         img_side = PILImage.fromarray(side)
@@ -87,8 +80,6 @@ def _save_sample_images(model, db_val, db_train, epoch_num, snapshot_path):
 
     train_row = make_row(db_train, 0, 'Train')
     val_row = make_row(db_val, 0, 'Val')
-
-    # Pad widths to match (should be identical)
     combined = np.concatenate([train_row, val_row], axis=0)
 
     out_dir = os.path.join(snapshot_path, 'samples')
@@ -117,12 +108,10 @@ def trainer_gapgrid(args, model, snapshot_path):
 
     train_loader = DataLoader(
         db_train, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=True,
-    )
+        num_workers=args.num_workers, pin_memory=True)
     val_loader = DataLoader(
         db_val, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=True,
-    )
+        num_workers=args.num_workers, pin_memory=True)
 
     if args.n_gpu > 1:
         model = nn.DataParallel(model)
@@ -189,10 +178,10 @@ def trainer_gapgrid(args, model, snapshot_path):
         writer.add_scalar('val/accuracy', accuracy, epoch_num)
         logging.info(
             f'epoch {epoch_num}: train_loss={train_loss:.4f}  '
-            f'val_loss={val_loss:.4f}  val_acc={accuracy:.4f}'
-        )
+            f'val_loss={val_loss:.4f}  val_acc={accuracy:.4f}')
 
-        save_path = os.path.join(snapshot_path, 'best_model.pth' if val_loss < best_val_loss else 'last_model.pth')
+        save_path = os.path.join(
+            snapshot_path, 'best_model.pth' if val_loss < best_val_loss else 'last_model.pth')
         torch.save(model.state_dict(), save_path)
         if val_loss < best_val_loss:
             best_val_loss = val_loss

@@ -1,29 +1,37 @@
 import argparse
 import os
 import random
+import sys
 
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 
+# Allow importing config.py / networks/ from the repo root regardless of cwd.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from config import get_config
-from datasets.dataset_gapgrid import NUM_CLASSES
+from dataset_pattern_removal import OUT_CHANS
 from networks.vision_transformer import SwinUnet
-from trainer_gapgrid import trainer_gapgrid
+from trainer_pattern_removal import trainer_pattern_removal
+
+DEFAULT_DATA_DIR = ('/home/lab-shared/gitrep/blender-render-tool/_test/'
+                     'medshape-colon-shapes-sequence-output-dist')
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--data_dirs', type=str, nargs='+', required=True,
-                    help='one or more paths to outimages directories')
+parser.add_argument('--data_dir', type=str, default=DEFAULT_DATA_DIR,
+                    help='path to medshape-colon-shapes-sequence-output-dist (contains sequence_XXXX/)')
 parser.add_argument('--output_dir', type=str, required=True,
                     help='directory to save checkpoints and logs')
 parser.add_argument('--cfg', type=str,
-                    default='configs/swin_tiny_patch4_window7_224_gapgrid.yaml',
+                    default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                          'configs', 'swin_tiny_patch4_window7_224_patternremoval.yaml'),
                     metavar='FILE', help='path to config file')
 parser.add_argument('--max_epochs', type=int, default=150)
 parser.add_argument('--batch_size', type=int, default=8,
-                    help='batch size per GPU')
-parser.add_argument('--base_lr', type=float, default=0.01)
-parser.add_argument('--img_size', type=int, default=224)
+                    help='batch size per GPU (clips per batch)')
+parser.add_argument('--base_lr', type=float, default=1e-4)
+parser.add_argument('--img_size', type=int, default=256)
 parser.add_argument('--n_gpu', type=int, default=1)
 parser.add_argument('--num_workers', type=int, default=8)
 parser.add_argument('--seed', type=int, default=1234)
@@ -68,7 +76,7 @@ if __name__ == '__main__':
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    net = SwinUnet(config, img_size=args.img_size, num_classes=NUM_CLASSES).cuda()
+    net = SwinUnet(config, img_size=args.img_size, num_classes=OUT_CHANS).cuda()
 
     if args.pretrained:
         net.load_from(config)
@@ -77,4 +85,4 @@ if __name__ == '__main__':
         msg = net.load_state_dict(torch.load(args.checkpoint, map_location='cuda'))
         print(f'Loaded checkpoint: {args.checkpoint}  ({msg})')
 
-    trainer_gapgrid(args, net, args.output_dir)
+    trainer_pattern_removal(args, net, args.output_dir)

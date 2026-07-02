@@ -78,6 +78,9 @@ class WindowAttention(nn.Module):
     r""" Window based multi-head self attention (W-MSA) module with relative position bias.
     It supports both of shifted and non-shifted window.
 
+    Note: this module's parameters depend only on window_size and dim, never on the
+    full feature map resolution, so it is naturally resolution-agnostic at inference time.
+
     Args:
         dim (int): Number of input channels.
         window_size (tuple[int]): The height and width of the window.
@@ -175,9 +178,16 @@ class WindowAttention(nn.Module):
 class SwinTransformerBlock(nn.Module):
     r""" Swin Transformer Block.
 
+    Resolution-agnostic at inference time: `input_resolution` is only used to size the
+    default (registered) shift-attention mask, so that this module's state_dict stays
+    byte-compatible with checkpoints trained at a fixed resolution. forward(x, H, W)
+    accepts any H, W (divisible by window_size); if it differs from the default
+    resolution the shift mask is recomputed on the fly (cheap, no learned parameters).
+
     Args:
         dim (int): Number of input channels.
-        input_resolution (tuple[int]): Input resulotion.
+        input_resolution (tuple[int]): Default resolution, used only to build the
+            registered shift-mask buffer (for checkpoint compatibility).
         num_heads (int): Number of attention heads.
         window_size (int): Window size.
         shift_size (int): Shift size for SW-MSA.
@@ -196,15 +206,14 @@ class SwinTransformerBlock(nn.Module):
                  act_layer=nn.GELU, norm_layer=nn.LayerNorm):
         super().__init__()
         self.dim = dim
-        self.input_resolution = input_resolution
+        self.default_resolution = input_resolution
         self.num_heads = num_heads
         self.window_size = window_size
         self.shift_size = shift_size
         self.mlp_ratio = mlp_ratio
-        if min(self.input_resolution) <= self.window_size:
-            # if window size is larger than input resolution, we don't partition windows
+        if min(input_resolution) <= self.window_size:
             self.shift_size = 0
-            self.window_size = min(self.input_resolution)
+            self.window_size = min(input_resolution)
         assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
 
         self.norm1 = norm_layer(dim)
@@ -218,32 +227,36 @@ class SwinTransformerBlock(nn.Module):
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
         if self.shift_size > 0:
-            # calculate attention mask for SW-MSA
-            H, W = self.input_resolution
-            img_mask = torch.zeros((1, H, W, 1))  # 1 H W 1
-            h_slices = (slice(0, -self.window_size),
-                        slice(-self.window_size, -self.shift_size),
-                        slice(-self.shift_size, None))
-            w_slices = (slice(0, -self.window_size),
-                        slice(-self.window_size, -self.shift_size),
-                        slice(-self.shift_size, None))
-            cnt = 0
-            for h in h_slices:
-                for w in w_slices:
-                    img_mask[:, h, w, :] = cnt
-                    cnt += 1
-
-            mask_windows = window_partition(img_mask, self.window_size)  # nW, window_size, window_size, 1
-            mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
-            attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
-            attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+            attn_mask = self._build_attn_mask(*input_resolution)
         else:
             attn_mask = None
 
         self.register_buffer("attn_mask", attn_mask)
 
-    def forward(self, x):
-        H, W = self.input_resolution
+    def _build_attn_mask(self, H, W, device=None):
+        """Build the SW-MSA cyclic-shift mask for an arbitrary (H, W). Pure geometry,
+        no learned parameters -- safe to recompute whenever H, W differs from the
+        resolution the module was constructed/trained with."""
+        img_mask = torch.zeros((1, H, W, 1), device=device)
+        h_slices = (slice(0, -self.window_size),
+                    slice(-self.window_size, -self.shift_size),
+                    slice(-self.shift_size, None))
+        w_slices = (slice(0, -self.window_size),
+                    slice(-self.window_size, -self.shift_size),
+                    slice(-self.shift_size, None))
+        cnt = 0
+        for h in h_slices:
+            for w in w_slices:
+                img_mask[:, h, w, :] = cnt
+                cnt += 1
+
+        mask_windows = window_partition(img_mask, self.window_size)  # nW, window_size, window_size, 1
+        mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
+        attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+        attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+        return attn_mask
+
+    def forward(self, x, H, W):
         B, L, C = x.shape
         assert L == H * W, "input feature has wrong size"
 
@@ -254,15 +267,20 @@ class SwinTransformerBlock(nn.Module):
         # cyclic shift
         if self.shift_size > 0:
             shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+            if (H, W) == tuple(self.default_resolution):
+                attn_mask = self.attn_mask
+            else:
+                attn_mask = self._build_attn_mask(H, W, device=x.device)
         else:
             shifted_x = x
+            attn_mask = None
 
         # partition windows
         x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
         x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
 
         # W-MSA/SW-MSA
-        attn_windows = self.attn(x_windows, mask=self.attn_mask)  # nW*B, window_size*window_size, C
+        attn_windows = self.attn(x_windows, mask=attn_mask)  # nW*B, window_size*window_size, C
 
         # merge windows
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
@@ -282,12 +300,12 @@ class SwinTransformerBlock(nn.Module):
         return x
 
     def extra_repr(self) -> str:
-        return f"dim={self.dim}, input_resolution={self.input_resolution}, num_heads={self.num_heads}, " \
+        return f"dim={self.dim}, default_resolution={self.default_resolution}, num_heads={self.num_heads}, " \
                f"window_size={self.window_size}, shift_size={self.shift_size}, mlp_ratio={self.mlp_ratio}"
 
     def flops(self):
         flops = 0
-        H, W = self.input_resolution
+        H, W = self.default_resolution
         # norm1
         flops += self.dim * H * W
         # W-MSA/SW-MSA
@@ -303,24 +321,24 @@ class SwinTransformerBlock(nn.Module):
 class PatchMerging(nn.Module):
     r""" Patch Merging Layer.
 
+    Resolution-agnostic: no learned parameter depends on H, W, so H, W are passed
+    explicitly to forward() rather than fixed at construction time.
+
     Args:
-        input_resolution (tuple[int]): Resolution of input feature.
         dim (int): Number of input channels.
         norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
     """
 
-    def __init__(self, input_resolution, dim, norm_layer=nn.LayerNorm):
+    def __init__(self, dim, norm_layer=nn.LayerNorm):
         super().__init__()
-        self.input_resolution = input_resolution
         self.dim = dim
         self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
         self.norm = norm_layer(4 * dim)
 
-    def forward(self, x):
+    def forward(self, x, H, W):
         """
         x: B, H*W, C
         """
-        H, W = self.input_resolution
         B, L, C = x.shape
         assert L == H * W, "input feature has wrong size"
         assert H % 2 == 0 and W % 2 == 0, f"x size ({H}*{W}) are not even."
@@ -340,28 +358,27 @@ class PatchMerging(nn.Module):
         return x
 
     def extra_repr(self) -> str:
-        return f"input_resolution={self.input_resolution}, dim={self.dim}"
+        return f"dim={self.dim}"
 
-    def flops(self):
-        H, W = self.input_resolution
+    def flops(self, H, W):
         flops = H * W * self.dim
         flops += (H // 2) * (W // 2) * 4 * self.dim * 2 * self.dim
         return flops
 
 
 class PatchExpand(nn.Module):
-    def __init__(self, input_resolution, dim, dim_scale=2, norm_layer=nn.LayerNorm):
+    """Resolution-agnostic: H, W passed explicitly to forward()."""
+
+    def __init__(self, dim, dim_scale=2, norm_layer=nn.LayerNorm):
         super().__init__()
-        self.input_resolution = input_resolution
         self.dim = dim
         self.expand = nn.Linear(dim, 2 * dim, bias=False) if dim_scale == 2 else nn.Identity()
         self.norm = norm_layer(dim // dim_scale)
 
-    def forward(self, x):
+    def forward(self, x, H, W):
         """
         x: B, H*W, C
         """
-        H, W = self.input_resolution
         x = self.expand(x)
         B, L, C = x.shape
         assert L == H * W, "input feature has wrong size"
@@ -375,20 +392,20 @@ class PatchExpand(nn.Module):
 
 
 class FinalPatchExpand_X4(nn.Module):
-    def __init__(self, input_resolution, dim, dim_scale=4, norm_layer=nn.LayerNorm):
+    """Resolution-agnostic: H, W passed explicitly to forward()."""
+
+    def __init__(self, dim, dim_scale=4, norm_layer=nn.LayerNorm):
         super().__init__()
-        self.input_resolution = input_resolution
         self.dim = dim
         self.dim_scale = dim_scale
         self.expand = nn.Linear(dim, 16 * dim, bias=False)
         self.output_dim = dim
         self.norm = norm_layer(self.output_dim)
 
-    def forward(self, x):
+    def forward(self, x, H, W):
         """
         x: B, H*W, C
         """
-        H, W = self.input_resolution
         x = self.expand(x)
         B, L, C = x.shape
         assert L == H * W, "input feature has wrong size"
@@ -405,9 +422,11 @@ class FinalPatchExpand_X4(nn.Module):
 class BasicLayer(nn.Module):
     """ A basic Swin Transformer layer for one stage.
 
+    forward(x, H, W) -> (x, H, W); H, W halve if a downsample layer is present.
+
     Args:
         dim (int): Number of input channels.
-        input_resolution (tuple[int]): Input resolution.
+        input_resolution (tuple[int]): Default resolution (for block shift-mask buffers).
         depth (int): Number of blocks.
         num_heads (int): Number of attention heads.
         window_size (int): Local window size.
@@ -446,19 +465,20 @@ class BasicLayer(nn.Module):
 
         # patch merging layer
         if downsample is not None:
-            self.downsample = downsample(input_resolution, dim=dim, norm_layer=norm_layer)
+            self.downsample = downsample(dim=dim, norm_layer=norm_layer)
         else:
             self.downsample = None
 
-    def forward(self, x):
+    def forward(self, x, H, W):
         for blk in self.blocks:
             if self.use_checkpoint:
-                x = checkpoint.checkpoint(blk, x)
+                x = checkpoint.checkpoint(blk, x, H, W)
             else:
-                x = blk(x)
+                x = blk(x, H, W)
         if self.downsample is not None:
-            x = self.downsample(x)
-        return x
+            x = self.downsample(x, H, W)
+            H, W = H // 2, W // 2
+        return x, H, W
 
     def extra_repr(self) -> str:
         return f"dim={self.dim}, input_resolution={self.input_resolution}, depth={self.depth}"
@@ -468,16 +488,18 @@ class BasicLayer(nn.Module):
         for blk in self.blocks:
             flops += blk.flops()
         if self.downsample is not None:
-            flops += self.downsample.flops()
+            flops += self.downsample.flops(*self.input_resolution)
         return flops
 
 
 class BasicLayer_up(nn.Module):
-    """ A basic Swin Transformer layer for one stage.
+    """ A basic Swin Transformer layer for one stage (decoder side).
+
+    forward(x, H, W) -> (x, H, W); H, W double if an upsample layer is present.
 
     Args:
         dim (int): Number of input channels.
-        input_resolution (tuple[int]): Input resolution.
+        input_resolution (tuple[int]): Default resolution (for block shift-mask buffers).
         depth (int): Number of blocks.
         num_heads (int): Number of attention heads.
         window_size (int): Local window size.
@@ -514,28 +536,34 @@ class BasicLayer_up(nn.Module):
                                  norm_layer=norm_layer)
             for i in range(depth)])
 
-        # patch merging layer
+        # patch expanding layer
         if upsample is not None:
-            self.upsample = PatchExpand(input_resolution, dim=dim, dim_scale=2, norm_layer=norm_layer)
+            self.upsample = PatchExpand(dim=dim, dim_scale=2, norm_layer=norm_layer)
         else:
             self.upsample = None
 
-    def forward(self, x):
+    def forward(self, x, H, W):
         for blk in self.blocks:
             if self.use_checkpoint:
-                x = checkpoint.checkpoint(blk, x)
+                x = checkpoint.checkpoint(blk, x, H, W)
             else:
-                x = blk(x)
+                x = blk(x, H, W)
         if self.upsample is not None:
-            x = self.upsample(x)
-        return x
+            x = self.upsample(x, H, W)
+            H, W = H * 2, W * 2
+        return x, H, W
 
 
 class PatchEmbed(nn.Module):
     r""" Image to Patch Embedding
 
+    The exact-size assert is relaxed: any H, W divisible by patch_size works.
+    `img_size`/`patches_resolution` are kept as defaults (used to size dependent
+    modules elsewhere), but forward() computes the actual patch grid from the
+    real input shape.
+
     Args:
-        img_size (int): Image size.  Default: 224.
+        img_size (int): Default image size (informational only). Default: 224.
         patch_size (int): Patch token size. Default: 4.
         in_chans (int): Number of input image channels. Default: 3.
         embed_dim (int): Number of linear projection output channels. Default: 96.
@@ -563,9 +591,8 @@ class PatchEmbed(nn.Module):
 
     def forward(self, x):
         B, C, H, W = x.shape
-        # FIXME look at relaxing size constraints
-        assert H == self.img_size[0] and W == self.img_size[1], \
-            f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
+        assert H % self.patch_size[0] == 0 and W % self.patch_size[1] == 0, \
+            f"Input image size ({H}*{W}) must be divisible by patch_size {self.patch_size}."
         x = self.proj(x).flatten(2).transpose(1, 2)  # B Ph*Pw C
         if self.norm is not None:
             x = self.norm(x)
@@ -584,8 +611,18 @@ class SwinTransformerSys(nn.Module):
         A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
           https://arxiv.org/pdf/2103.14030
 
+    Resolution-agnostic at inference time: forward() derives the patch grid (H, W)
+    from the actual input tensor shape and threads it through encoder/decoder/up_x4,
+    rather than relying on a resolution fixed at construction. H, W (and every
+    intermediate stage resolution) must be divisible by `window_size`, and the full
+    patch grid must be divisible by `2**(num_layers-1)` (so that every PatchMerging /
+    PatchExpand halves/doubles into an integer size). Equivalently, the input image
+    H, W must be a multiple of `size_divisor` (see below). The module's learned
+    parameters (and therefore checkpoints trained at a fixed img_size) are unaffected.
+
     Args:
-        img_size (int | tuple(int)): Input image size. Default 224
+        img_size (int | tuple(int)): Default input image size, used only to size the
+            registered (checkpoint-compatible) shift-attention-mask buffers. Default 224
         patch_size (int | tuple(int)): Patch size. Default: 4
         in_chans (int): Number of input image channels. Default: 3
         num_classes (int): Number of classes for classification head. Default: 1000
@@ -627,6 +664,11 @@ class SwinTransformerSys(nn.Module):
         self.num_features_up = int(embed_dim * 2)
         self.mlp_ratio = mlp_ratio
         self.final_upsample = final_upsample
+        self.patch_size = to_2tuple(patch_size)[0]
+        self.window_size = window_size
+        # Required divisor of the input image H, W for direct (non-tiled) inference:
+        # every stage's spatial resolution must stay divisible by window_size.
+        self.size_divisor = self.patch_size * window_size * (2 ** (self.num_layers - 1))
 
         # split image into non-overlapping patches
         self.patch_embed = PatchEmbed(
@@ -673,8 +715,6 @@ class SwinTransformerSys(nn.Module):
                                                   self.num_layers - 1 - i_layer))) if i_layer > 0 else nn.Identity()
             if i_layer == 0:
                 layer_up = PatchExpand(
-                    input_resolution=(patches_resolution[0] // (2 ** (self.num_layers - 1 - i_layer)),
-                                      patches_resolution[1] // (2 ** (self.num_layers - 1 - i_layer))),
                     dim=int(embed_dim * 2 ** (self.num_layers - 1 - i_layer)), dim_scale=2, norm_layer=norm_layer)
             else:
                 layer_up = BasicLayer_up(dim=int(embed_dim * 2 ** (self.num_layers - 1 - i_layer)),
@@ -700,8 +740,7 @@ class SwinTransformerSys(nn.Module):
 
         if self.final_upsample == "expand_first":
             print("---final upsample expand_first---")
-            self.up = FinalPatchExpand_X4(input_resolution=(img_size // patch_size, img_size // patch_size),
-                                          dim_scale=4, dim=embed_dim)
+            self.up = FinalPatchExpand_X4(dim_scale=4, dim=embed_dim)
             self.output = nn.Conv2d(in_channels=embed_dim, out_channels=self.num_classes, kernel_size=1, bias=False)
 
         self.apply(self._init_weights)
@@ -725,41 +764,51 @@ class SwinTransformerSys(nn.Module):
 
     # Encoder and Bottleneck
     def forward_features(self, x):
+        B, C, H_img, W_img = x.shape
+        assert H_img % self.size_divisor == 0 and W_img % self.size_divisor == 0, \
+            f"input size ({H_img}x{W_img}) must be a multiple of {self.size_divisor} " \
+            f"for direct (non-tiled) inference."
+
         x = self.patch_embed(x)
+        H = H_img // self.patch_size
+        W = W_img // self.patch_size
+
         if self.ape:
+            assert (H, W) == tuple(self.patches_resolution), \
+                "absolute position embedding requires the default resolution"
             x = x + self.absolute_pos_embed
         x = self.pos_drop(x)
         x_downsample = []
 
         for layer in self.layers:
             x_downsample.append(x)
-            x = layer(x)
+            x, H, W = layer(x, H, W)
 
         x = self.norm(x)  # B L C
 
-        return x, x_downsample
+        return x, x_downsample, H, W
 
     # Dencoder and Skip connection
-    def forward_up_features(self, x, x_downsample):
+    def forward_up_features(self, x, x_downsample, H, W):
         for inx, layer_up in enumerate(self.layers_up):
             if inx == 0:
-                x = layer_up(x)
+                x = layer_up(x, H, W)  # bare PatchExpand: returns x only
+                H, W = H * 2, W * 2
             else:
                 x = torch.cat([x, x_downsample[3 - inx]], -1)
                 x = self.concat_back_dim[inx](x)
-                x = layer_up(x)
+                x, H, W = layer_up(x, H, W)
 
         x = self.norm_up(x)  # B L C
 
-        return x
+        return x, H, W
 
-    def up_x4(self, x):
-        H, W = self.patches_resolution
+    def up_x4(self, x, H, W):
         B, L, C = x.shape
         assert L == H * W, "input features has wrong size"
 
         if self.final_upsample == "expand_first":
-            x = self.up(x)
+            x = self.up(x, H, W)
             x = x.view(B, 4 * H, 4 * W, -1)
             x = x.permute(0, 3, 1, 2)  # B,C,H,W
             x = self.output(x)
@@ -767,9 +816,9 @@ class SwinTransformerSys(nn.Module):
         return x
 
     def forward(self, x):
-        x, x_downsample = self.forward_features(x)
-        x = self.forward_up_features(x, x_downsample)
-        x = self.up_x4(x)
+        x, x_downsample, H, W = self.forward_features(x)
+        x, H, W = self.forward_up_features(x, x_downsample, H, W)
+        x = self.up_x4(x, H, W)
 
         return x
 

@@ -1,5 +1,5 @@
 gapgrid-dataset/outimages/**
-model_out/gapgrid/**
+model_out/
 pretrained_ckpt/
 __pycache__/
 *.pyc

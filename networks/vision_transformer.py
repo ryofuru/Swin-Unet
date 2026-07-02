@@ -85,6 +85,12 @@ class SwinUnet(nn.Module):
                     avg_ch = w_pre.mean(dim=1, keepdim=True)          # (embed_dim, 1, ph, pw)
                     full_dict[pe_key] = torch.cat([w_pre, avg_ch], dim=1)  # (embed_dim, 4, ph, pw)
                     print(f'Expanded {pe_key}: {list(w_pre.shape)} -> {list(full_dict[pe_key].shape)}')
+                elif w_pre.shape[1] == 3 and w_mod.shape[1] % 3 == 0:
+                    # e.g. pattern-removal stacks N RGB video frames on the channel axis;
+                    # tile the pretrained RGB filters once per frame group.
+                    repeats = w_mod.shape[1] // 3
+                    full_dict[pe_key] = w_pre.repeat(1, repeats, 1, 1)
+                    print(f'Tiled {pe_key} x{repeats}: {list(w_pre.shape)} -> {list(full_dict[pe_key].shape)}')
 
             for k in list(full_dict.keys()):
                 if k in model_dict:

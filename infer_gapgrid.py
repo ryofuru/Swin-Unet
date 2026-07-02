@@ -9,8 +9,13 @@ Inputs (per image):
 Output:
   nodeid-format PNG per image: R=0, G=id//256, B=id%256
 
-Sliding-window inference tiles the full image with 224x224 patches.
-Adjacent tiles overlap at the right/bottom edges; the later tile overwrites.
+Inference processes the full image directly in a single forward pass (no tiling):
+the network's window attention only depends on window_size, not image resolution,
+so a model trained at 224x224 can be run on arbitrarily larger images as long as
+H, W are divisible by `net.swin_unet.size_divisor` (224 by default). Images that
+aren't an exact multiple are reflect-padded up to the next multiple, then cropped
+back to the original size after inference -- this avoids the tile-boundary
+artifacts that sliding-window inference produces.
 
 Usage (direct):
   python infer_gapgrid.py \\
@@ -29,6 +34,7 @@ import sys
 import numpy as np
 import torch
 from PIL import Image
+from scipy import ndimage as ndi
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -41,13 +47,55 @@ from networks.vision_transformer import SwinUnet
 # I/O helpers
 # ---------------------------------------------------------------------------
 
-def load_input(data_dir: str, file_index: int) -> np.ndarray:
-    """Return (H, W, 4) float32 in [0, 1]."""
-    fname = f'{file_index:06d}.png'
-    h = np.array(Image.open(os.path.join(data_dir, 'h_phase',          fname)))[:, :, 0]
-    v = np.array(Image.open(os.path.join(data_dir, 'v_phase',          fname)))[:, :, 0]
-    c = np.array(Image.open(os.path.join(data_dir, 'colored_traindata', fname)))[:, :, 1]
-    t = np.array(Image.open(os.path.join(data_dir, 'traindata_code',   fname)))[:, :, 0]
+def _load_channel(path: str, ch: int) -> np.ndarray:
+    """Load one channel from a PNG (handles both grayscale and RGB)."""
+    arr = np.array(Image.open(path))
+    return arr if arr.ndim == 2 else arr[:, :, ch]
+
+
+def make_phase_region_mask(h: np.ndarray, v: np.ndarray,
+                           disc_threshold: int = 50, radius: int = 8) -> np.ndarray:
+    """
+    Segment the image into regions by phase discontinuities in h and v,
+    then return mask M: circles of radius `radius` px around each region centroid.
+
+    h, v  : uint8 (H, W)
+    returns: uint8 (H, W), 1 inside circles, 0 outside
+    """
+    H, W = h.shape
+    boundary = np.zeros((H, W), dtype=bool)
+
+    for ch in (h.astype(np.float32), v.astype(np.float32)):
+        dx = np.abs(np.diff(ch, axis=1))
+        boundary[:, :-1] |= dx > disc_threshold
+        boundary[:, 1:]  |= dx > disc_threshold
+        dy = np.abs(np.diff(ch, axis=0))
+        boundary[:-1, :] |= dy > disc_threshold
+        boundary[1:, :]  |= dy > disc_threshold
+
+    labels, n_labels = ndi.label(~boundary)
+
+    ys, xs = np.mgrid[0:H, 0:W]
+    mask = np.zeros((H, W), dtype=np.uint8)
+    for lbl in range(1, n_labels + 1):
+        region = labels == lbl
+        cy = float(ys[region].mean())
+        cx = float(xs[region].mean())
+        mask[(ys - cy) ** 2 + (xs - cx) ** 2 <= radius ** 2] = 1
+
+    return mask
+
+
+def load_input(data_dir: str, fname: str) -> np.ndarray:
+    """Return (H, W, 4) float32 in [0, 1], with phase-region mask applied to code."""
+    h = _load_channel(os.path.join(data_dir, 'h_phase',           fname), 0)
+    v = _load_channel(os.path.join(data_dir, 'v_phase',           fname), 0)
+    c = _load_channel(os.path.join(data_dir, 'colored_traindata',  fname), 1)
+    t = _load_channel(os.path.join(data_dir, 'traindata_code',    fname), 0)
+
+    mask = make_phase_region_mask(h, v)
+    t = t * mask  # zero code outside region centroids
+
     return np.stack([h, v, c, t], axis=2).astype(np.float32) / 255.0
 
 
@@ -61,40 +109,46 @@ def pred_to_nodeid_image(pred: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Sliding-window inference
+# Direct (non-tiled) full-image inference
 # ---------------------------------------------------------------------------
 
-def _patch_starts(size: int, patch: int) -> list[int]:
-    """Non-overlapping starts that cover [0, size) completely."""
-    starts = list(range(0, size - patch, patch))
-    starts.append(size - patch)          # last patch flush with the edge
-    return starts
+def pad_to_multiple(image_4ch: np.ndarray, multiple: int):
+    """Reflect-pad image_4ch (H, W, C) so H, W become multiples of `multiple`.
+
+    Returns (padded, orig_H, orig_W).
+    """
+    H, W = image_4ch.shape[:2]
+    pad_h = (-H) % multiple
+    pad_w = (-W) % multiple
+    if pad_h == 0 and pad_w == 0:
+        return image_4ch, H, W
+    padded = np.pad(image_4ch, ((0, pad_h), (0, pad_w), (0, 0)), mode='reflect')
+    return padded, H, W
 
 
 def predict_full_image(
     net: torch.nn.Module,
     image_4ch: np.ndarray,
-    patch_size: int = 224,
+    size_divisor: int = 224,
     device: str = 'cuda',
 ) -> np.ndarray:
     """
-    Tile the full image with patch_size x patch_size crops and run inference.
-    Returns int32 class-id map of shape (H, W).
+    Run the network directly on the full image in a single forward pass (no
+    tiling). The window-attention weights only depend on window_size, not image
+    resolution, so this reuses the trained weights as-is. The image is
+    reflect-padded up to a multiple of `size_divisor` if necessary, then the
+    prediction is cropped back to the original size.
+
+    Returns int32 class-id map of shape (H, W) -- same size as the input.
     """
-    H, W = image_4ch.shape[:2]
-    pred = np.zeros((H, W), dtype=np.int32)
+    padded, H, W = pad_to_multiple(image_4ch, size_divisor)
+    t = torch.from_numpy(padded.transpose(2, 0, 1)).unsqueeze(0).float().to(device)
 
     net.eval()
     with torch.no_grad():
-        for top in _patch_starts(H, patch_size):
-            for left in _patch_starts(W, patch_size):
-                patch = image_4ch[top:top + patch_size, left:left + patch_size]
-                t = (torch.from_numpy(patch.transpose(2, 0, 1))
-                         .unsqueeze(0).float().to(device))
-                p = net(t).argmax(dim=1).squeeze(0).cpu().numpy().astype(np.int32)
-                pred[top:top + patch_size, left:left + patch_size] = p
+        pred = net(t).argmax(dim=1).squeeze(0).cpu().numpy().astype(np.int32)
 
-    return pred
+    return pred[:H, :W]
 
 
 # ---------------------------------------------------------------------------
@@ -141,18 +195,22 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    indices = args.indices if args.indices is not None else list(range(200))
-    n_patches = len(_patch_starts(1200, args.img_size)) ** 2   # informational
+    if args.indices is not None:
+        fnames = [f'{i:06d}.png' for i in args.indices]
+    else:
+        fnames = sorted(f for f in os.listdir(os.path.join(args.data_dir, 'h_phase'))
+                        if f.endswith('.png'))
 
-    print(f'Processing {len(indices)} images, '
-          f'{n_patches} patches each ({args.img_size}x{args.img_size})')
+    size_divisor = net.swin_unet.size_divisor
+    print(f'Processing {len(fnames)} images directly (no tiling), '
+          f'padded to multiples of {size_divisor}')
 
-    for idx in tqdm(indices, unit='img'):
-        image_4ch = load_input(args.data_dir, idx)
+    for fname in tqdm(fnames, unit='img'):
+        image_4ch = load_input(args.data_dir, fname)
         pred      = predict_full_image(net, image_4ch,
-                                       patch_size=args.img_size, device=device)
+                                       size_divisor=size_divisor, device=device)
         rgb       = pred_to_nodeid_image(pred)
-        Image.fromarray(rgb).save(os.path.join(args.output_dir, f'{idx:06d}.png'))
+        Image.fromarray(rgb).save(os.path.join(args.output_dir, fname))
 
     print(f'Done. Predictions saved to: {args.output_dir}')
 
